@@ -170,6 +170,13 @@ class Preprocess
   int lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
   double blind;
   bool feature_enabled, given_offset_time;
+
+  // 尾部盲区（跟随者过滤）: 排除机体后方扇形区域内的点云
+  // 实验时操作者跟随在机器狗后方（LiDAR坐标系X轴负方向），
+  // 其身体会被LiDAR持续扫到，干扰SLAM建图和导航避障
+  bool   tail_fov_blind_en = false;   // 尾部盲区开关
+  double tail_fov_half_angle = 30.0;  // 尾部盲区半角(度)，默认±30°即后方60°扇区
+  double tail_fov_blind_range = 5.0;  // 盲区最大作用距离(米)，超出此距离的点不过滤
   // ros::Publisher pub_full, pub_surf, pub_corn;
 
 private:

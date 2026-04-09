@@ -185,6 +185,25 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
               || (abs(pl_full[i].z - pl_full[i-1].z) > 1e-7))
               && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
           {
+            // 尾部盲区过滤: 排除机体后方扇形区域
+            // 实验时操作者站在机器狗后方(LiDAR的X轴负方向)，
+            // 其身体会被持续扫描到，导致地图出现"鬼影"和导航误避障
+            if (tail_fov_blind_en)
+            {
+              double px = pl_full[i].x;
+              double py = pl_full[i].y;
+              double range_xy = sqrt(px * px + py * py);
+              // 仅对作用距离内的点进行角度过滤（远处的结构物不应被过滤）
+              if (range_xy < tail_fov_blind_range && px < 0)  // X<0 即后方
+              {
+                // atan2(|y|, |x|) 计算偏离负X轴的角度
+                double angle_from_neg_x = atan2(fabs(py), fabs(px)) * 180.0 / M_PI;
+                if (angle_from_neg_x < tail_fov_half_angle)
+                {
+                  continue;  // 在盲区内，跳过该点
+                }
+              }
+            }
             pl_surf.push_back(pl_full[i]);
           }
         }

@@ -22,6 +22,12 @@
             blind: 0.1
             timestamp_unit: 3
             scan_rate: 10
+            # 尾部盲区 (跟随者过滤): 实验时操作者跟随在机器狗后方,
+            # 其身体会被LiDAR扫描到, 在地图中产生"鬼影"并干扰导航避障
+            # 后方对应LiDAR坐标系X轴负方向
+            tail_fov_blind_en: true       # 跟随者过滤开关
+            tail_fov_half_angle: 30.0     # 盲区半角(度): 后方±30°=60°扇区
+            tail_fov_blind_range: 5.0     # 盲区最大距离(米): 超出不过滤
 
         mapping:
             acc_cov: 0.1

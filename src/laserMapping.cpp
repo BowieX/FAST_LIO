@@ -928,6 +928,9 @@ public:
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
         this->declare_parameter<int>("preprocess.scan_rate", 10);
+        this->declare_parameter<bool>("preprocess.tail_fov_blind_en", false);
+        this->declare_parameter<double>("preprocess.tail_fov_half_angle", 30.0);
+        this->declare_parameter<double>("preprocess.tail_fov_blind_range", 5.0);
         this->declare_parameter<int>("point_filter_num", 2);
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
@@ -972,6 +975,15 @@ public:
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+        this->get_parameter_or<bool>("preprocess.tail_fov_blind_en", p_pre->tail_fov_blind_en, false);
+        this->get_parameter_or<double>("preprocess.tail_fov_half_angle", p_pre->tail_fov_half_angle, 30.0);
+        this->get_parameter_or<double>("preprocess.tail_fov_blind_range", p_pre->tail_fov_blind_range, 5.0);
+        if (p_pre->tail_fov_blind_en)
+        {
+            RCLCPP_INFO(this->get_logger(),
+                "Tail FOV blind zone ENABLED: half_angle=%.1f deg, range=%.1f m (filtering follower behind robot)",
+                p_pre->tail_fov_half_angle, p_pre->tail_fov_blind_range);
+        }
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
