@@ -143,6 +143,109 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
+// ======================== 里程计位置约束相关变量 ========================
+// 用于融合外部里程计 (robot_localization 输出) 以抑制几何退化场景下的漂移
+mutex mtx_odom;                                // ��程计数���互斥锁
+bool odom_constraint_en = false;               // 里程计约束总开关 (由配置文件控制)
+bool odom_received = false;                    // 是否已收到第一帧odom
+bool odom_init_offset_set = false;             // 初始坐标系偏移是否已设定
+V3D odom_latest_pos(Zero3d);                   // 最新的融合里程计位置 (odom_fused帧)
+V3D odom_init_offset(Zero3d);                  // camera_init帧与odom_fused帧的初始位置偏移
+double odom_latest_time = 0.0;                 // 最新odom时间戳
+int    degradation_feat_threshold = 50;        // 几何退化判定: 有效特征点数阈值
+double degradation_residual_threshold = 0.3;   // 几何退化判定: 平均残差阈值
+double odom_noise_normal = 10.0;               // 正常状态下odom量测噪声 (大=低权重)
+double odom_noise_degraded = 0.1;              // 退化状态下odom量测噪声 (小=高权重)
+string odom_topic_name = "/odometry/filtered"; // 外部融合里程计话题名
+
+// 里程计数据回调函数: 缓存最新的融合里程计位置
+void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+{
+    lock_guard<mutex> lock(mtx_odom);
+    odom_latest_pos(0) = msg->pose.pose.position.x;
+    odom_latest_pos(1) = msg->pose.pose.position.y;
+    odom_latest_pos(2) = msg->pose.pose.position.z;
+    odom_latest_time = rclcpp::Time(msg->header.stamp).seconds();
+    odom_received = true;
+}
+
+/**
+ * @brief 里程计位置约束更新 — 在ESEKF点面更新之后执行
+ *
+ * 数学原理:
+ *   将外部融合里���计的位置作为对ESEKF���态中位置分量的直接观测。
+ *   量测模型: h(x) = x.pos (3维位置)
+ *   量测矩阵: H = [I_{3x3}, 0_{3x20}] (3x23)
+ *   当检测到几何退化时，减小量测噪声R使里程计约束获得更大权重。
+ *
+ * @param kf_state ESEKF状态估计器
+ * @param is_degraded 当前是否处于几何退化状态
+ */
+void apply_odom_position_constraint(
+    esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state,
+    bool is_degraded)
+{
+    V3D cur_odom_pos;
+    {
+        lock_guard<mutex> lock(mtx_odom);
+        if (!odom_received) return;
+        cur_odom_pos = odom_latest_pos;
+    }
+
+    // 获取当前ESEKF状态和协方差
+    state_ikfom x = kf_state.get_x();
+    auto P = kf_state.get_P();  // 23x23 协方差矩阵 (DOF维度)
+
+    // 首次收到odom时，计算 camera_init 帧与 odom_fused 帧的位置偏移
+    // 后续通过此偏移将odom位置转换到 camera_init 坐标系下
+    if (!odom_init_offset_set)
+    {
+        odom_init_offset = V3D(x.pos(0), x.pos(1), x.pos(2)) - cur_odom_pos;
+        odom_init_offset_set = true;
+        return;  // 首帧仅记录偏移，不执行更新
+    }
+
+    // 将odom位置从odom_fused帧转换到camera_init帧
+    V3D odom_pos_in_camera_init = cur_odom_pos + odom_init_offset;
+
+    // 构建量测矩阵 H (3x23): 仅观测位置分量
+    // state_ikfom DOF排列: pos(0:2), rot(3:5), offset_R(6:8), offset_T(9:11),
+    //                       vel(12:14), bg(15:17), ba(18:20), grav(21:22)
+    Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
+    H.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+
+    // 量测残差: z = 观测位置 - 预测位置
+    V3D state_pos(x.pos(0), x.pos(1), x.pos(2));
+    Eigen::Vector3d z = odom_pos_in_camera_init - state_pos;
+
+    // 根据退化状态动态调整量测噪声
+    // 退化时噪声小 → 里程计权重大；正常时噪声大 → 里程计权重小 (几乎不影响)
+    double sigma = is_degraded ? odom_noise_degraded : odom_noise_normal;
+    Eigen::Matrix3d R = Eigen::Matrix3d::Identity() * sigma;
+
+    // ===== 标准 Kalman 滤波更新 =====
+    // 创新协方差: S = H * P * H^T + R
+    Eigen::Matrix3d S = H * P * H.transpose() + R;
+
+    // Kalman增益: K = P * H^T * S^{-1}
+    Eigen::Matrix<double, 23, 3> K = P * H.transpose() * S.inverse();
+
+    // 状态增量: dx = K * z
+    Eigen::Matrix<double, 23, 1> dx = K * z;
+
+    // 在流形上更新状态 (使用 boxplus 运算符处理 SO3/S2 等非欧空间)
+    x.boxplus(dx);
+
+    // Joseph form 协方差更新 (比简单形式 P=(I-KH)P 数值更稳定)
+    // P_new = (I - K*H) * P * (I - K*H)^T + K * R * K^T
+    Eigen::Matrix<double, 23, 23> I_KH = Eigen::Matrix<double, 23, 23>::Identity() - K * H;
+    P = I_KH * P * I_KH.transpose() + K * R * K.transpose();
+
+    // 写回更新后的状态和协方差
+    kf_state.change_x(x);
+    kf_state.change_P(P);
+}
+
 void SigHandle(int sig)
 {
     flg_exit = true;
@@ -834,6 +937,14 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
+        // 里程计位置约束参数
+        this->declare_parameter<bool>("odom_constraint.enable", false);
+        this->declare_parameter<string>("odom_constraint.odom_topic", "/odometry/filtered");
+        this->declare_parameter<int>("odom_constraint.degradation_feat_threshold", 50);
+        this->declare_parameter<double>("odom_constraint.degradation_residual_threshold", 0.3);
+        this->declare_parameter<double>("odom_constraint.odom_noise_normal", 10.0);
+        this->declare_parameter<double>("odom_constraint.odom_noise_degraded", 0.1);
+
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -869,6 +980,20 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+
+        // 读取里程计约束参数
+        this->get_parameter_or<bool>("odom_constraint.enable", odom_constraint_en, false);
+        this->get_parameter_or<string>("odom_constraint.odom_topic", odom_topic_name, "/odometry/filtered");
+        this->get_parameter_or<int>("odom_constraint.degradation_feat_threshold", degradation_feat_threshold, 50);
+        this->get_parameter_or<double>("odom_constraint.degradation_residual_threshold", degradation_residual_threshold, 0.3);
+        this->get_parameter_or<double>("odom_constraint.odom_noise_normal", odom_noise_normal, 10.0);
+        this->get_parameter_or<double>("odom_constraint.odom_noise_degraded", odom_noise_degraded, 0.1);
+        if (odom_constraint_en)
+        {
+            RCLCPP_INFO(this->get_logger(), "Odom constraint ENABLED, topic: %s", odom_topic_name.c_str());
+            RCLCPP_INFO(this->get_logger(), "  Degradation thresholds: feat_num<%d, residual>%.2f",
+                        degradation_feat_threshold, degradation_residual_threshold);
+        }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -927,6 +1052,14 @@ public:
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+
+        // 里程计约束: 订阅外部融合里程计
+        if (odom_constraint_en)
+        {
+            sub_odom_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                odom_topic_name, 50, odom_cbk);
+        }
+
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1050,6 +1183,28 @@ private:
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+
+            // ==================== 里程计位置约束 (几何退化场景增强) ====================
+            // 在标准点面 ESEKF 更新之后，根据退化检测结果追加里程计位置约束
+            if (odom_constraint_en)
+            {
+                // 几何退化检测: 有效特征点过少 或 平均残差过大 → 判定为退化
+                bool is_degraded = (effct_feat_num < degradation_feat_threshold) ||
+                                   (res_mean_last > degradation_residual_threshold);
+
+                if (is_degraded)
+                {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "Geometric degradation detected! feat_num=%d, res_mean=%.3f. "
+                        "Applying odom constraint with high weight.",
+                        effct_feat_num, res_mean_last);
+                }
+
+                // 执行里程计位置约束更新 (退化时高权重，正常时低权重)
+                apply_odom_position_constraint(kf, is_degraded);
+            }
+            // =========================================================================
+
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1138,6 +1293,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;  // 外部融合里程计
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;

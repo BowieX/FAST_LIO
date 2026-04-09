@@ -44,7 +44,18 @@
             dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
+        # 里程计位置约束配置 (用于抑制几何退化场景下的漂移)
+        # 原理: 在ESEKF点面更新之后，追加一个基于外部融合里程计的位置��束更新
+        # 退化判据: 有效特征点数 < feat_threshold 或 平均残差 > residual_threshold
+        odom_constraint:
+            enable: true                              # 里程计约束总开关
+            odom_topic: "/odometry/filtered"           # robot_localization 输出的融合里程计话题
+            degradation_feat_threshold: 50             # 有效特征点数阈值 (低于此值判定为退化)
+            degradation_residual_threshold: 0.3        # 平均残差阈值 (高于此值判定为退化)
+            odom_noise_normal: 10.0                    # 正常状态: 里程计量测噪声 (大=低权重，几乎不影响)
+            odom_noise_degraded: 0.1                   # 退化状态: 里程计量测噪声 (小=高权重，强约束)
+
         pcd_save:
             pcd_save_en: true
-            interval: -1                 # how many LiDAR frames saved in each pcd file; 
+            interval: -1                 # how many LiDAR frames saved in each pcd file;
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
