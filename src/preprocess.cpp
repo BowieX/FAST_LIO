@@ -570,6 +570,21 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
 
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
+      // 尾部盲区过滤: 排除机体后方扇形区域 (与 avia_handler 逻辑一致)
+      if (tail_fov_blind_en)
+      {
+        double px = added_pt.x;
+        double py = added_pt.y;
+        double range_xy = sqrt(px * px + py * py);
+        if (range_xy < tail_fov_blind_range && px < 0)
+        {
+          double angle_from_neg_x = atan2(fabs(py), fabs(px)) * 180.0 / M_PI;
+          if (angle_from_neg_x < tail_fov_half_angle)
+          {
+            continue;  // 在盲区内，跳过该点
+          }
+        }
+      }
       pl_surf.push_back(std::move(added_pt));
     }
   }
