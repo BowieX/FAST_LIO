@@ -3,8 +3,11 @@
         feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 3
-        filter_size_surf: 0.5
-        filter_size_map: 0.5
+        # 下采样尺寸: 值越小精度越高但算力越重
+        # 默认 0.5m (室外保守), 本项目室内 + Jetson AGX Orin 算力充足，调到 0.3/0.4
+        # 若 CPU 占用过高 (>80%) 可回到 0.5/0.5
+        filter_size_surf: 0.3
+        filter_size_map: 0.4
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
@@ -25,9 +28,14 @@
             # 尾部盲区 (跟随者过滤): 实验时操作者跟随在机器狗后方,
             # 其身体会被LiDAR扫描到, 在地图中产生"鬼影"并干扰导航避障
             # 后方对应LiDAR坐标系X轴负方向
+            #
+            # 参数选择建议 (见实验手册 §10.6):
+            #   - 远距离跟随 (≥3m): half_angle=30°, range=5.0m (默认)
+            #   - 近距离跟随 (1-2m): half_angle=40°, range=2.5m (当前配置)
+            #   - 无人跟随: 关闭 tail_fov_blind_en
             tail_fov_blind_en: true       # 跟随者过滤开关
-            tail_fov_half_angle: 30.0     # 盲区半角(度): 后方±30°=60°扇区
-            tail_fov_blind_range: 5.0     # 盲区最大距离(米): 超出不过滤
+            tail_fov_half_angle: 40.0     # 盲区半角(度): 后方±40°=80°扇区 (近距离跟随)
+            tail_fov_blind_range: 2.5     # 盲区最大距离(米): 只过滤近处，远处结构保留
 
         mapping:
             acc_cov: 0.1
