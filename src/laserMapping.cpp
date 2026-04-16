@@ -162,6 +162,12 @@ string odom_topic_name = "/odometry/filtered"; // 外部融合里程计话题名
 void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
 {
     lock_guard<mutex> lock(mtx_odom);
+    // 安全检查: 过滤 NaN/Inf (EKF 发散时可能产生)
+    if (!std::isfinite(msg->pose.pose.position.x) ||
+        !std::isfinite(msg->pose.pose.position.y) ||
+        !std::isfinite(msg->pose.pose.position.z)) {
+        return;  // 丢弃异常数据，不更新缓存
+    }
     odom_latest_pos(0) = msg->pose.pose.position.x;
     odom_latest_pos(1) = msg->pose.pose.position.y;
     odom_latest_pos(2) = msg->pose.pose.position.z;
