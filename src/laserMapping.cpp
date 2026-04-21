@@ -152,11 +152,17 @@ bool odom_init_offset_set = false;             // 初始坐标系偏移是否已
 V3D odom_latest_pos(Zero3d);                   // 最新的融合里程计位置 (odom_fused帧)
 V3D odom_init_offset(Zero3d);                  // camera_init帧与odom_fused帧的初始位置偏移
 double odom_latest_time = 0.0;                 // 最新odom时间戳
-int    degradation_feat_threshold = 50;        // 几何退化判定: 有效特征点数阈值
-double degradation_residual_threshold = 0.3;   // 几何退化判定: 平均残差阈值
+int    degradation_feat_threshold = 200;       // 几何退化判定: 有效特征点数阈值 (走廊场景须偏高，见 §10.1)
+double degradation_residual_threshold = 0.15;  // 几何退化判定: 平均残差阈值
 double odom_noise_normal = 10.0;               // 正常状态下odom量测噪声 (大=低权重)
 double odom_noise_degraded = 0.1;              // 退化状态下odom量测噪声 (小=高权重)
+double odom_timeout = 0.5;                     // Odom 超时阈值(秒): 超过则跳过约束, 防止 stale 数据拖偏滤波器
 string odom_topic_name = "/odometry/filtered"; // 外部融合里程计话题名
+
+// 消融实验统计 (触发率): 用于验证退化判据是否真的在走廊段触发
+// 在 main loop 中每应用一次约束即累加, 周期性 INFO 输出供 evaluate_slam.sh 提取
+long g_total_constraint_frames = 0;
+long g_degraded_frames = 0;
 
 // 里程计数据回调函数: 缓存最新的融合里程计位置
 void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
@@ -179,22 +185,41 @@ void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
  * @brief 里程计位置约束更新 — 在ESEKF点面更新之后执行
  *
  * 数学原理:
- *   将外部融合里���计的位置作为对ESEKF���态中位置分量的直接观测。
+ *   将外部融合里程计的位置作为对ESEKF状态中位置分量的直接观测。
  *   量测模型: h(x) = x.pos (3维位置)
  *   量测矩阵: H = [I_{3x3}, 0_{3x20}] (3x23)
  *   当检测到几何退化时，减小量测噪声R使里程计约束获得更大权重。
  *
  * @param kf_state ESEKF状态估计器
  * @param is_degraded 当前是否处于几何退化状态
+ * @param current_time 当前节点时间(秒, 可能是 sim time), 用于 odom 超时检查
+ * @param timeout_sec odom 超时阈值(秒); 超过则跳过本次更新, 防止 EKF 崩溃后 stale 数据拖偏
  */
 void apply_odom_position_constraint(
     esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state,
-    bool is_degraded)
+    bool is_degraded,
+    double current_time,
+    double timeout_sec)
 {
     V3D cur_odom_pos;
     {
         lock_guard<mutex> lock(mtx_odom);
         if (!odom_received) return;
+
+        // Odom 超时保护: 防止 EKF 崩溃/停发时, 滤波器继续使用老位置观测把状态拖向历史值
+        double age = current_time - odom_latest_time;
+        if (age > timeout_sec)
+        {
+            static double last_warn_time = 0.0;
+            if (current_time - last_warn_time > 2.0)
+            {
+                std::cerr << "[odom_constraint] Odom stale (age=" << age
+                          << "s > " << timeout_sec << "s), skipping constraint update"
+                          << std::endl;
+                last_warn_time = current_time;
+            }
+            return;
+        }
         cur_odom_pos = odom_latest_pos;
     }
 
@@ -621,8 +646,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
-    /* 2. noted that pcd save will influence the real-time performences **/
-    /*
+     * 2. pcd save will influence real-time performance — on Jetson AGX Orin this is acceptable */
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -649,7 +673,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             scan_wait_num = 0;
         }
     }
-    */
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -949,10 +972,11 @@ public:
         // 里程计位置约束参数
         this->declare_parameter<bool>("odom_constraint.enable", false);
         this->declare_parameter<string>("odom_constraint.odom_topic", "/odometry/filtered");
-        this->declare_parameter<int>("odom_constraint.degradation_feat_threshold", 50);
-        this->declare_parameter<double>("odom_constraint.degradation_residual_threshold", 0.3);
+        this->declare_parameter<int>("odom_constraint.degradation_feat_threshold", 200);
+        this->declare_parameter<double>("odom_constraint.degradation_residual_threshold", 0.15);
         this->declare_parameter<double>("odom_constraint.odom_noise_normal", 10.0);
         this->declare_parameter<double>("odom_constraint.odom_noise_degraded", 0.1);
+        this->declare_parameter<double>("odom_constraint.odom_timeout", 0.5);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1002,15 +1026,16 @@ public:
         // 读取里程计约束参数
         this->get_parameter_or<bool>("odom_constraint.enable", odom_constraint_en, false);
         this->get_parameter_or<string>("odom_constraint.odom_topic", odom_topic_name, "/odometry/filtered");
-        this->get_parameter_or<int>("odom_constraint.degradation_feat_threshold", degradation_feat_threshold, 50);
-        this->get_parameter_or<double>("odom_constraint.degradation_residual_threshold", degradation_residual_threshold, 0.3);
+        this->get_parameter_or<int>("odom_constraint.degradation_feat_threshold", degradation_feat_threshold, 200);
+        this->get_parameter_or<double>("odom_constraint.degradation_residual_threshold", degradation_residual_threshold, 0.15);
         this->get_parameter_or<double>("odom_constraint.odom_noise_normal", odom_noise_normal, 10.0);
         this->get_parameter_or<double>("odom_constraint.odom_noise_degraded", odom_noise_degraded, 0.1);
+        this->get_parameter_or<double>("odom_constraint.odom_timeout", odom_timeout, 0.5);
         if (odom_constraint_en)
         {
             RCLCPP_INFO(this->get_logger(), "Odom constraint ENABLED, topic: %s", odom_topic_name.c_str());
-            RCLCPP_INFO(this->get_logger(), "  Degradation thresholds: feat_num<%d, residual>%.2f",
-                        degradation_feat_threshold, degradation_residual_threshold);
+            RCLCPP_INFO(this->get_logger(), "  Degradation thresholds: feat_num<%d, residual>%.2f, timeout=%.2fs",
+                        degradation_feat_threshold, degradation_residual_threshold, odom_timeout);
         }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
@@ -1210,6 +1235,19 @@ private:
                 bool is_degraded = (effct_feat_num < degradation_feat_threshold) ||
                                    (res_mean_last > degradation_residual_threshold);
 
+                // 触发率统计 (消融实验用): 每 100 帧汇报一次累计退化率
+                // evaluate_slam.sh 通过 grep "[OdomStat]" 提取最后一次汇报作为触发率
+                g_total_constraint_frames++;
+                if (is_degraded) g_degraded_frames++;
+                if (g_total_constraint_frames % 100 == 0)
+                {
+                    double rate = 100.0 * g_degraded_frames / g_total_constraint_frames;
+                    RCLCPP_INFO(this->get_logger(),
+                        "[OdomStat] degraded=%ld/%ld (%.1f%%), feat_num=%d, res_mean=%.3f",
+                        g_degraded_frames, g_total_constraint_frames, rate,
+                        effct_feat_num, res_mean_last);
+                }
+
                 if (is_degraded)
                 {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -1219,7 +1257,9 @@ private:
                 }
 
                 // 执行里程计位置约束更新 (退化时高权重，正常时低权重)
-                apply_odom_position_constraint(kf, is_degraded);
+                // 传入当前节点时间 (支持 sim time) + 超时阈值, 用于 odom stale 保护
+                double now_sec = this->get_clock()->now().seconds();
+                apply_odom_position_constraint(kf, is_degraded, now_sec, odom_timeout);
             }
             // =========================================================================
 
