@@ -145,7 +145,7 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 // ======================== 里程计位置约束相关变量 ========================
 // 用于融合外部里程计 (robot_localization 输出) 以抑制几何退化场景下的漂移
-mutex mtx_odom;                                // ��程计数���互斥锁
+mutex mtx_odom;                                // 里程计数据互斥锁
 bool odom_constraint_en = false;               // 里程计约束总开关 (由配置文件控制)
 bool odom_received = false;                    // 是否已收到第一帧odom
 bool odom_init_offset_set = false;             // 初始坐标系偏移是否已设定
