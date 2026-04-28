@@ -59,7 +59,7 @@
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
         # 里程计位置约束配置 (用于抑制几何退化场景下的漂移)
-        # 原理: 在ESEKF点面更新之后，追加一个基于外部融合里程计的位置约束更新
+        # 原理: 在ESEKF点面更新之后，追加一个基于外部融合里程计的XY位置约束更新
         # 退化判据: 有效特征点数 < feat_threshold 或 平均残差 > residual_threshold
         #
         # 阈值调优建议 (见实验手册 §10.1):
@@ -73,8 +73,8 @@
             odom_topic: "/odometry/filtered"           # robot_localization 输出的融合里程计话题
             degradation_feat_threshold: 200            # 有效特征点数阈值 (低于此值判定为退化)
             degradation_residual_threshold: 0.15       # 平均残差阈值 (高于此值判定为退化)
-            odom_noise_normal: 10.0                    # 正常状态: 里程计量测噪声 (大=低权重，几乎不影响)
-            odom_noise_degraded: 0.1                   # 退化状态: 里程计量测噪声 (小=高权重，强约束)
+            odom_noise_normal: 10.0                    # 正常状态: XY量测标准差(m), 代码中平方为R
+            odom_noise_degraded: 0.1                   # 退化状态: XY量测标准差(m), 小=高权重
             odom_timeout: 0.5                          # Odom 超时阈值(秒): EKF 崩溃/停发 > 此时长则跳过约束 (防止 stale 数据拖偏)
 
         pcd_save:

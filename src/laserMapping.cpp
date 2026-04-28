@@ -149,8 +149,8 @@ mutex mtx_odom;                                // 里程计数据互斥锁
 bool odom_constraint_en = false;               // 里程计约束总开关 (由配置文件控制)
 bool odom_received = false;                    // 是否已收到第一帧odom
 bool odom_init_offset_set = false;             // 初始坐标系偏移是否已设定
-V3D odom_latest_pos(Zero3d);                   // 最新的融合里程计位置 (odom_fused帧)
-V3D odom_init_offset(Zero3d);                  // camera_init帧与odom_fused帧的初始位置偏移
+V3D odom_latest_pos(Zero3d);                   // 最新的融合里程计位置 (unitree_odom帧)
+V3D odom_init_offset(Zero3d);                  // camera_init帧与unitree_odom帧的初始位置偏移
 double odom_latest_time = 0.0;                 // 最新odom时间戳
 int    degradation_feat_threshold = 200;       // 几何退化判定: 有效特征点数阈值 (走廊场景须偏高，见 §10.1)
 double degradation_residual_threshold = 0.15;  // 几何退化判定: 平均残差阈值
@@ -185,9 +185,11 @@ void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
  * @brief 里程计位置约束更新 — 在ESEKF点面更新之后执行
  *
  * 数学原理:
- *   将外部融合里程计的位置作为对ESEKF状态中位置分量的直接观测。
- *   量测模型: h(x) = x.pos (3维位置)
- *   量测矩阵: H = [I_{3x3}, 0_{3x20}] (3x23)
+ *   将外部融合里程计的XY位置作为对ESEKF状态中平面位置分量的直接观测。
+ *   量测模型: h(x) = [x.pos_x, x.pos_y]^T (2维平面位置)
+ *   量测矩阵: H = [I_{2x2}, 0_{2x21}] (2x23)
+ *   仅约束XY的原因: Go1腿部里程计不融合Z, Z主要包含步态颠簸与IMU积分误差;
+ *   对退化走廊最关键的是平面漂移, 因此避免用弱可信Z观测拉动FAST-LIO高度。
  *   当检测到几何退化时，减小量测噪声R使里程计约束获得更大权重。
  *
  * @param kf_state ESEKF状态估计器
@@ -227,7 +229,7 @@ void apply_odom_position_constraint(
     state_ikfom x = kf_state.get_x();
     auto P = kf_state.get_P();  // 23x23 协方差矩阵 (DOF维度)
 
-    // 首次收到odom时，计算 camera_init 帧与 odom_fused 帧的位置偏移
+    // 首次收到odom时，计算 camera_init 帧与 unitree_odom 帧的位置偏移
     // 后续通过此偏移将odom位置转换到 camera_init 坐标系下
     if (!odom_init_offset_set)
     {
@@ -236,30 +238,32 @@ void apply_odom_position_constraint(
         return;  // 首帧仅记录偏移，不执行更新
     }
 
-    // 将odom位置从odom_fused帧转换到camera_init帧
+    // 将odom位置从unitree_odom帧转换到camera_init帧
     V3D odom_pos_in_camera_init = cur_odom_pos + odom_init_offset;
 
-    // 构建量测矩阵 H (3x23): 仅观测位置分量
+    // 构建量测矩阵 H (2x23): 仅观测XY平面位置分量
     // state_ikfom DOF排列: pos(0:2), rot(3:5), offset_R(6:8), offset_T(9:11),
     //                       vel(12:14), bg(15:17), ba(18:20), grav(21:22)
-    Eigen::Matrix<double, 3, 23> H = Eigen::Matrix<double, 3, 23>::Zero();
-    H.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+    Eigen::Matrix<double, 2, 23> H = Eigen::Matrix<double, 2, 23>::Zero();
+    H.block<2, 2>(0, 0) = Eigen::Matrix2d::Identity();
 
     // 量测残差: z = 观测位置 - 预测位置
-    V3D state_pos(x.pos(0), x.pos(1), x.pos(2));
-    Eigen::Vector3d z = odom_pos_in_camera_init - state_pos;
+    Eigen::Vector2d state_pos_xy(x.pos(0), x.pos(1));
+    Eigen::Vector2d odom_pos_xy(
+        odom_pos_in_camera_init(0), odom_pos_in_camera_init(1));
+    Eigen::Vector2d z = odom_pos_xy - state_pos_xy;
 
     // 根据退化状态动态调整量测噪声
     // 退化时噪声小 → 里程计权重大；正常时噪声大 → 里程计权重小 (几乎不影响)
     double sigma = is_degraded ? odom_noise_degraded : odom_noise_normal;
-    Eigen::Matrix3d R = Eigen::Matrix3d::Identity() * sigma;
+    Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * sigma * sigma;
 
     // ===== 标准 Kalman 滤波更新 =====
     // 创新协方差: S = H * P * H^T + R
-    Eigen::Matrix3d S = H * P * H.transpose() + R;
+    Eigen::Matrix2d S = H * P * H.transpose() + R;
 
     // Kalman增益: K = P * H^T * S^{-1}
-    Eigen::Matrix<double, 23, 3> K = P * H.transpose() * S.inverse();
+    Eigen::Matrix<double, 23, 2> K = P * H.transpose() * S.inverse();
 
     // 状态增量: dx = K * z
     Eigen::Matrix<double, 23, 1> dx = K * z;
