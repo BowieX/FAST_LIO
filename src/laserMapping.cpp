@@ -148,9 +148,13 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 mutex mtx_odom;                                // 里程计数据互斥锁
 bool odom_constraint_en = false;               // 里程计约束总开关 (由配置文件控制)
 bool odom_received = false;                    // 是否已收到第一帧odom
-bool odom_init_offset_set = false;             // 初始坐标系偏移是否已设定
+bool odom_init_alignment_set = false;          // 初始SE(2)坐标系对齐是否已设定
 V3D odom_latest_pos(Zero3d);                   // 最新的融合里程计位置 (unitree_odom帧)
-V3D odom_init_offset(Zero3d);                  // camera_init帧与unitree_odom帧的初始位置偏移
+V3D odom_init_pos(Zero3d);                     // 初始融合里程计位置 (unitree_odom帧)
+V3D lio_init_pos(Zero3d);                      // 初始FAST-LIO位置 (camera_init帧)
+double odom_latest_yaw = 0.0;                  // 最新融合里程计yaw (unitree_odom帧)
+double odom_init_yaw = 0.0;                    // 初始融合里程计yaw
+double lio_init_yaw = 0.0;                     // 初始FAST-LIO yaw
 double odom_latest_time = 0.0;                 // 最新odom时间戳
 int    degradation_feat_threshold = 200;       // 几何退化判定: 有效特征点数阈值 (走廊场景须偏高，见 §10.1)
 double degradation_residual_threshold = 0.15;  // 几何退化判定: 平均残差阈值
@@ -164,6 +168,20 @@ string odom_topic_name = "/odometry/filtered"; // 外部融合里程计话题名
 long g_total_constraint_frames = 0;
 long g_degraded_frames = 0;
 
+double yaw_from_quaternion(const geometry_msgs::msg::Quaternion &q)
+{
+    // ROS REP-103: yaw 为绕 Z 轴旋转角. 这里只用于平面 SE(2) 初始对齐.
+    double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+    double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+    return atan2(siny_cosp, cosy_cosp);
+}
+
+double yaw_from_state(const state_ikfom &x)
+{
+    Eigen::Matrix3d R = x.rot.toRotationMatrix();
+    return atan2(R(1, 0), R(0, 0));
+}
+
 // 里程计数据回调函数: 缓存最新的融合里程计位置
 void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
 {
@@ -171,12 +189,17 @@ void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     // 安全检查: 过滤 NaN/Inf (EKF 发散时可能产生)
     if (!std::isfinite(msg->pose.pose.position.x) ||
         !std::isfinite(msg->pose.pose.position.y) ||
-        !std::isfinite(msg->pose.pose.position.z)) {
+        !std::isfinite(msg->pose.pose.position.z) ||
+        !std::isfinite(msg->pose.pose.orientation.x) ||
+        !std::isfinite(msg->pose.pose.orientation.y) ||
+        !std::isfinite(msg->pose.pose.orientation.z) ||
+        !std::isfinite(msg->pose.pose.orientation.w)) {
         return;  // 丢弃异常数据，不更新缓存
     }
     odom_latest_pos(0) = msg->pose.pose.position.x;
     odom_latest_pos(1) = msg->pose.pose.position.y;
     odom_latest_pos(2) = msg->pose.pose.position.z;
+    odom_latest_yaw = yaw_from_quaternion(msg->pose.pose.orientation);
     odom_latest_time = rclcpp::Time(msg->header.stamp).seconds();
     odom_received = true;
 }
@@ -204,6 +227,7 @@ void apply_odom_position_constraint(
     double timeout_sec)
 {
     V3D cur_odom_pos;
+    double cur_odom_yaw;
     {
         lock_guard<mutex> lock(mtx_odom);
         if (!odom_received) return;
@@ -223,23 +247,38 @@ void apply_odom_position_constraint(
             return;
         }
         cur_odom_pos = odom_latest_pos;
+        cur_odom_yaw = odom_latest_yaw;
     }
 
     // 获取当前ESEKF状态和协方差
     state_ikfom x = kf_state.get_x();
     auto P = kf_state.get_P();  // 23x23 协方差矩阵 (DOF维度)
 
-    // 首次收到odom时，计算 camera_init 帧与 unitree_odom 帧的位置偏移
-    // 后续通过此偏移将odom位置转换到 camera_init 坐标系下
-    if (!odom_init_offset_set)
+    // 首次收到odom时，记录 camera_init 与 unitree_odom 的初始 SE(2) 关系:
+    //   1) 两帧原点不同: 记录各自初始位置, 后续使用 odom 位移增量;
+    //   2) 两套 IMU/里程计的初始 yaw 可能有小偏差: 记录 yaw 差并旋转 odom 平面位移.
+    // 这样比简单的 p_odom + 平移 offset 更稳, 同时仍不通过 TF 桥接两棵子树.
+    if (!odom_init_alignment_set)
     {
-        odom_init_offset = V3D(x.pos(0), x.pos(1), x.pos(2)) - cur_odom_pos;
-        odom_init_offset_set = true;
-        return;  // 首帧仅记录偏移，不执行更新
+        odom_init_pos = cur_odom_pos;
+        lio_init_pos = V3D(x.pos(0), x.pos(1), x.pos(2));
+        odom_init_yaw = cur_odom_yaw;
+        lio_init_yaw = yaw_from_state(x);
+        odom_init_alignment_set = true;
+        return;  // 首帧仅记录初始对齐，不执行更新
     }
 
-    // 将odom位置从unitree_odom帧转换到camera_init帧
-    V3D odom_pos_in_camera_init = cur_odom_pos + odom_init_offset;
+    // 将 odom 的 XY 位移从 unitree_odom 投到 camera_init 平面.
+    // Z 仍保留初始 FAST-LIO 高度, 后续量测矩阵只约束 XY, 不会使用该分量.
+    double yaw_delta = lio_init_yaw - odom_init_yaw;
+    double c = cos(yaw_delta);
+    double s = sin(yaw_delta);
+    double dx_odom = cur_odom_pos(0) - odom_init_pos(0);
+    double dy_odom = cur_odom_pos(1) - odom_init_pos(1);
+    V3D odom_pos_in_camera_init(
+        lio_init_pos(0) + c * dx_odom - s * dy_odom,
+        lio_init_pos(1) + s * dx_odom + c * dy_odom,
+        lio_init_pos(2));
 
     // 构建量测矩阵 H (2x23): 仅观测XY平面位置分量
     // state_ikfom DOF排列: pos(0:2), rot(3:5), offset_R(6:8), offset_T(9:11),
