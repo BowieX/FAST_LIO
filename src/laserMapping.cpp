@@ -147,6 +147,7 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 // 用于融合外部里程计 (robot_localization 输出) 以抑制几何退化场景下的漂移
 mutex mtx_odom;                                // 里程计数据互斥锁
 bool odom_constraint_en = false;               // 里程计约束总开关 (由配置文件控制)
+bool odom_force_degraded = false;              // 常开强约束消融: 将所有成功约束帧视为退化帧
 bool odom_received = false;                    // 是否已收到第一帧odom
 bool odom_init_alignment_set = false;          // 初始SE(2)坐标系对齐是否已设定
 V3D odom_latest_pos(Zero3d);                   // 最新的融合里程计位置 (unitree_odom帧)
@@ -1051,6 +1052,7 @@ public:
 
         // 里程计位置约束参数
         this->declare_parameter<bool>("odom_constraint.enable", false);
+        this->declare_parameter<bool>("odom_constraint.force_degraded", false);
         this->declare_parameter<string>("odom_constraint.odom_topic", "/odometry/filtered");
         this->declare_parameter<int>("odom_constraint.degradation_feat_threshold", 200);
         this->declare_parameter<double>("odom_constraint.degradation_residual_threshold", 0.15);
@@ -1105,6 +1107,7 @@ public:
 
         // 读取里程计约束参数
         this->get_parameter_or<bool>("odom_constraint.enable", odom_constraint_en, false);
+        this->get_parameter_or<bool>("odom_constraint.force_degraded", odom_force_degraded, false);
         this->get_parameter_or<string>("odom_constraint.odom_topic", odom_topic_name, "/odometry/filtered");
         this->get_parameter_or<int>("odom_constraint.degradation_feat_threshold", degradation_feat_threshold, 200);
         this->get_parameter_or<double>("odom_constraint.degradation_residual_threshold", degradation_residual_threshold, 0.15);
@@ -1116,6 +1119,12 @@ public:
             RCLCPP_INFO(this->get_logger(), "Odom constraint ENABLED, topic: %s", odom_topic_name.c_str());
             RCLCPP_INFO(this->get_logger(), "  Degradation thresholds: feat_num<%d, residual>%.2f, timeout=%.2fs",
                         degradation_feat_threshold, degradation_residual_threshold, odom_timeout);
+            if (odom_force_degraded)
+            {
+                RCLCPP_WARN(this->get_logger(),
+                    "  force_degraded=true: every valid odom constraint frame uses high weight. "
+                    "Use only for always-on ablation experiments.");
+            }
         }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
@@ -1312,7 +1321,8 @@ private:
             if (odom_constraint_en)
             {
                 // 几何退化检测: 有效特征点过少 或 平均残差过大 → 判定为退化
-                bool is_degraded = (effct_feat_num < degradation_feat_threshold) ||
+                bool is_degraded = odom_force_degraded ||
+                                   (effct_feat_num < degradation_feat_threshold) ||
                                    (res_mean_last > degradation_residual_threshold);
 
                 // 触发率统计 (消融实验用): 每 100 个成功应用约束帧汇报一次累计退化率

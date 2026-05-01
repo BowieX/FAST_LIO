@@ -21,6 +21,7 @@ def generate_launch_description():
     config_path = LaunchConfiguration('config_path')
     config_file = LaunchConfiguration('config_file')
     odom_constraint_enable = LaunchConfiguration('odom_constraint_enable')
+    odom_constraint_force_degraded = LaunchConfiguration('odom_constraint_force_degraded')
     rviz_use = LaunchConfiguration('rviz')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
 
@@ -40,6 +41,10 @@ def generate_launch_description():
         'odom_constraint_enable', default_value='false',
         description='Enable FAST-LIO odom position constraint'
     )
+    declare_odom_constraint_force_degraded_cmd = DeclareLaunchArgument(
+        'odom_constraint_force_degraded', default_value='false',
+        description='Force all odom constraint frames to use degraded high weight (ablation only)'
+    )
     declare_rviz_cmd = DeclareLaunchArgument(
         'rviz', default_value='true',
         description='Use RViz to monitor results'
@@ -58,6 +63,8 @@ def generate_launch_description():
                             use_sim_time, value_type=bool),
                         'odom_constraint.enable': ParameterValue(
                             odom_constraint_enable, value_type=bool),
+                        'odom_constraint.force_degraded': ParameterValue(
+                            odom_constraint_force_degraded, value_type=bool),
                     }],
         output='screen'
     )
@@ -73,6 +80,7 @@ def generate_launch_description():
     ld.add_action(declare_config_path_cmd)
     ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_odom_constraint_cmd)
+    ld.add_action(declare_odom_constraint_force_degraded_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
 

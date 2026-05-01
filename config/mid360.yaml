@@ -70,6 +70,7 @@
         #   避免退化段几乎不触发导致消融实验"改进未生效"。
         odom_constraint:
             enable: false                             # 里程计约束总开关 (默认关闭，消融实验时通过 replay launch 覆盖)
+            force_degraded: false                     # 常开强约束消融开关: true 时所有约束帧都按退化高权重处理
             odom_topic: "/odometry/filtered"           # robot_localization 输出的融合里程计话题
             degradation_feat_threshold: 200            # 有效特征点数阈值 (低于此值判定为退化)
             degradation_residual_threshold: 0.15       # 平均残差阈值 (高于此值判定为退化)
