@@ -156,6 +156,7 @@ double odom_latest_yaw = 0.0;                  // 最新融合里程计yaw (unit
 double odom_init_yaw = 0.0;                    // 初始融合里程计yaw
 double lio_init_yaw = 0.0;                     // 初始FAST-LIO yaw
 double odom_latest_time = 0.0;                 // 最新odom时间戳
+double odom_latest_speed = 0.0;                // 最新融合里程计平面速度, 用于静止启动守卫
 int    degradation_feat_threshold = 200;       // 几何退化判定: 有效特征点数阈值 (走廊场景须偏高，见 §10.1)
 double degradation_residual_threshold = 0.15;  // 几何退化判定: 平均残差阈值
 double odom_noise_normal = 10.0;               // 正常状态下odom量测噪声 (大=低权重)
@@ -164,7 +165,7 @@ double odom_timeout = 0.5;                     // Odom 超时阈值(秒): 超过
 string odom_topic_name = "/odometry/filtered"; // 外部融合里程计话题名
 
 // 消融实验统计 (触发率): 用于验证退化判据是否真的在走廊段触发
-// 在 main loop 中每应用一次约束即累加, 周期性 INFO 输出供 evaluate_slam.sh 提取
+// 在 main loop 中每成功应用一次约束即累加, 周期性 INFO 输出供 evaluate_slam.sh 提取
 long g_total_constraint_frames = 0;
 long g_degraded_frames = 0;
 
@@ -182,7 +183,7 @@ double yaw_from_state(const state_ikfom &x)
     return atan2(R(1, 0), R(0, 0));
 }
 
-// 里程计数据回调函数: 缓存最新的融合里程计位置
+// 里程计数据回调函数: 缓存最新的融合里程计位置与平面速度
 void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
 {
     lock_guard<mutex> lock(mtx_odom);
@@ -193,13 +194,18 @@ void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
         !std::isfinite(msg->pose.pose.orientation.x) ||
         !std::isfinite(msg->pose.pose.orientation.y) ||
         !std::isfinite(msg->pose.pose.orientation.z) ||
-        !std::isfinite(msg->pose.pose.orientation.w)) {
+        !std::isfinite(msg->pose.pose.orientation.w) ||
+        !std::isfinite(msg->twist.twist.linear.x) ||
+        !std::isfinite(msg->twist.twist.linear.y)) {
         return;  // 丢弃异常数据，不更新缓存
     }
     odom_latest_pos(0) = msg->pose.pose.position.x;
     odom_latest_pos(1) = msg->pose.pose.position.y;
     odom_latest_pos(2) = msg->pose.pose.position.z;
     odom_latest_yaw = yaw_from_quaternion(msg->pose.pose.orientation);
+    odom_latest_speed = sqrt(
+        msg->twist.twist.linear.x * msg->twist.twist.linear.x +
+        msg->twist.twist.linear.y * msg->twist.twist.linear.y);
     odom_latest_time = rclcpp::Time(msg->header.stamp).seconds();
     odom_received = true;
 }
@@ -219,8 +225,9 @@ void odom_cbk(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
  * @param is_degraded 当前是否处于几何退化状态
  * @param current_time 当前节点时间(秒, 可能是 sim time), 用于 odom 超时检查
  * @param timeout_sec odom 超时阈值(秒); 超过则跳过本次更新, 防止 EKF 崩溃后 stale 数据拖偏
+ * @return true 表示本帧成功应用了 odom 位置约束; false 表示因无数据/超时/未完成静止对齐而跳过
  */
-void apply_odom_position_constraint(
+bool apply_odom_position_constraint(
     esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state,
     bool is_degraded,
     double current_time,
@@ -228,9 +235,10 @@ void apply_odom_position_constraint(
 {
     V3D cur_odom_pos;
     double cur_odom_yaw;
+    double cur_odom_speed;
     {
         lock_guard<mutex> lock(mtx_odom);
-        if (!odom_received) return;
+        if (!odom_received) return false;
 
         // Odom 超时保护: 防止 EKF 崩溃/停发时, 滤波器继续使用老位置观测把状态拖向历史值
         double age = current_time - odom_latest_time;
@@ -244,10 +252,11 @@ void apply_odom_position_constraint(
                           << std::endl;
                 last_warn_time = current_time;
             }
-            return;
+            return false;
         }
         cur_odom_pos = odom_latest_pos;
         cur_odom_yaw = odom_latest_yaw;
+        cur_odom_speed = odom_latest_speed;
     }
 
     // 获取当前ESEKF状态和协方差
@@ -258,14 +267,41 @@ void apply_odom_position_constraint(
     //   1) 两帧原点不同: 记录各自初始位置, 后续使用 odom 位移增量;
     //   2) 两套 IMU/里程计的初始 yaw 可能有小偏差: 记录 yaw 差并旋转 odom 平面位移.
     // 这样比简单的 p_odom + 平移 offset 更稳, 同时仍不通过 TF 桥接两棵子树.
+    //
+    // 静止启动守卫 (见 algorithm_design.md §7.5):
+    //   FAST-LIO 与 EKF 启动节奏不同步 (EKF ~0.5-1.5s 先稳, FAST-LIO 还在 IMU 静态初始化),
+    //   若该窗内机器人已遥控前进, 用第一帧 odom/lio 做 SE(2) 对齐会把启动位移当成"原点偏移",
+    //   后续退化段会被这个偏置稳定拖偏 ~0.1-0.15 m. 这里要求 FAST-LIO 平面速度
+    //   < 0.05 m/s (机器人在 XY 接近静止) 才设置初始对齐, 否则推迟到下一帧.
+    //   只取 X/Y 是因为初始 SE(2) 对齐本身只关心平面位姿; Go1 步态会让 Z 速度
+    //   即使在"完全站立"时也短时震荡到 0.1-0.2 m/s 量级, 用 3D 速度范数会让守卫
+    //   长期挂在"还在动"分支永不对齐.
+    //   同时检查 odom 平面速度: 若 odom 已显著运动而 LIO 速度还小 (启动同步问题), 也推迟.
     if (!odom_init_alignment_set)
     {
+        double lio_planar_speed = sqrt(x.vel(0) * x.vel(0) + x.vel(1) * x.vel(1));
+        if (lio_planar_speed >= 0.05 || cur_odom_speed >= 0.05)
+        {
+            // 还在动, 推迟初始对齐. 节流警告 (5 秒一次), 防止 IMU init 失败/IMU 线松等
+            // 故障下 odom 约束静默失效却没有任何提示.
+            static double last_static_warn = 0.0;
+            if (current_time - last_static_warn > 5.0)
+            {
+                std::cerr << "[odom_constraint] Waiting for static init: "
+                          << "lio_planar_speed=" << lio_planar_speed
+                          << " m/s, odom_planar_speed=" << cur_odom_speed
+                          << " m/s (need both < 0.05). 若机器人已停稳超过几秒, "
+                          << "检查 IMU 数据/EKF 是否正常." << std::endl;
+                last_static_warn = current_time;
+            }
+            return false;
+        }
         odom_init_pos = cur_odom_pos;
         lio_init_pos = V3D(x.pos(0), x.pos(1), x.pos(2));
         odom_init_yaw = cur_odom_yaw;
         lio_init_yaw = yaw_from_state(x);
         odom_init_alignment_set = true;
-        return;  // 首帧仅记录初始对齐，不执行更新
+        return false;  // 首帧仅记录初始对齐，不执行更新
     }
 
     // 将 odom 的 XY 位移从 unitree_odom 投到 camera_init 平面.
@@ -318,6 +354,7 @@ void apply_odom_position_constraint(
     // 写回更新后的状态和协方差
     kf_state.change_x(x);
     kf_state.change_P(P);
+    return true;
 }
 
 void SigHandle(int sig)
@@ -1278,19 +1315,8 @@ private:
                 bool is_degraded = (effct_feat_num < degradation_feat_threshold) ||
                                    (res_mean_last > degradation_residual_threshold);
 
-                // 触发率统计 (消融实验用): 每 100 帧汇报一次累计退化率
+                // 触发率统计 (消融实验用): 每 100 个成功应用约束帧汇报一次累计退化率
                 // evaluate_slam.sh 通过 grep "[OdomStat]" 提取最后一次汇报作为触发率
-                g_total_constraint_frames++;
-                if (is_degraded) g_degraded_frames++;
-                if (g_total_constraint_frames % 100 == 0)
-                {
-                    double rate = 100.0 * g_degraded_frames / g_total_constraint_frames;
-                    RCLCPP_INFO(this->get_logger(),
-                        "[OdomStat] degraded=%ld/%ld (%.1f%%), feat_num=%d, res_mean=%.3f",
-                        g_degraded_frames, g_total_constraint_frames, rate,
-                        effct_feat_num, res_mean_last);
-                }
-
                 if (is_degraded)
                 {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -1302,7 +1328,21 @@ private:
                 // 执行里程计位置约束更新 (退化时高权重，正常时低权重)
                 // 传入当前节点时间 (支持 sim time) + 超时阈值, 用于 odom stale 保护
                 double now_sec = this->get_clock()->now().seconds();
-                apply_odom_position_constraint(kf, is_degraded, now_sec, odom_timeout);
+                bool constraint_applied =
+                    apply_odom_position_constraint(kf, is_degraded, now_sec, odom_timeout);
+                if (constraint_applied)
+                {
+                    g_total_constraint_frames++;
+                    if (is_degraded) g_degraded_frames++;
+                    if (g_total_constraint_frames % 100 == 0)
+                    {
+                        double rate = 100.0 * g_degraded_frames / g_total_constraint_frames;
+                        RCLCPP_INFO(this->get_logger(),
+                            "[OdomStat] degraded=%ld/%ld (%.1f%%), feat_num=%d, res_mean=%.3f",
+                            g_degraded_frames, g_total_constraint_frames, rate,
+                            effct_feat_num, res_mean_last);
+                    }
+                }
             }
             // =========================================================================
 
