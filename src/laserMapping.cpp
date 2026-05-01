@@ -1344,6 +1344,16 @@ private:
                 {
                     g_total_constraint_frames++;
                     if (is_degraded) g_degraded_frames++;
+
+                    // 逐帧空间分布日志: evaluate_slam.sh 阶段 6 用此行画退化触发点空间分布图
+                    // 字段固定为 t/deg/x/y/feat/res, 便于 awk/grep 解析; 每帧一行(~10Hz)。
+                    state_ikfom cur_x = kf.get_x();
+                    RCLCPP_INFO(this->get_logger(),
+                        "[OdomFrame] t=%.3f deg=%d x=%.3f y=%.3f feat=%d res=%.3f",
+                        now_sec, is_degraded ? 1 : 0,
+                        cur_x.pos(0), cur_x.pos(1),
+                        effct_feat_num, res_mean_last);
+
                     if (g_total_constraint_frames % 100 == 0)
                     {
                         double rate = 100.0 * g_degraded_frames / g_total_constraint_frames;
